@@ -12,10 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import json
+import os
 import re
 from copy import deepcopy
-from time import time
+from time import monotonic, time
 from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
 from uuid import uuid4
 
@@ -62,6 +64,63 @@ from nemo_gym.openai_utils import (
     TokenIDLogProbMixin,
 )
 from nemo_gym.server_utils import SESSION_ID_KEY, is_nemo_gym_fastapi_worker
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _short_text(value: Any, limit: int) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...<trimmed:{len(text) - limit}>"
+
+
+def _metadata_summary(metadata: Any) -> Dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    return {
+        "instance_id": metadata.get("instance_id"),
+        "subset": metadata.get("subset"),
+        "split": metadata.get("split"),
+        "policy_model_name": metadata.get("policy_model_name"),
+        "agent_name": metadata.get("agent_name"),
+        "agent_env": metadata.get("agent_env"),
+        "step_limit": metadata.get("step_limit"),
+        "collapse_limit": metadata.get("collapse_limit"),
+        "chat_template_kwargs": metadata.get("chat_template_kwargs"),
+        "extra_body": metadata.get("extra_body"),
+    }
+
+
+def _normalize_token_id_list(value: Any) -> List[int]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [int(v) for v in value]
+    if isinstance(value, tuple):
+        return [int(v) for v in value]
+    return [int(v) for v in value]
+
+
+def _required_prefix_token_ids_from_messages(messages: Any) -> Optional[List[int]]:
+    if not isinstance(messages, list):
+        return None
+    for message_dict in reversed(messages):
+        if not isinstance(message_dict, dict):
+            continue
+        prompt_token_ids = message_dict.get("prompt_token_ids")
+        if prompt_token_ids is None:
+            continue
+        generation_token_ids = message_dict.get("generation_token_ids")
+        return _normalize_token_id_list(prompt_token_ids) + _normalize_token_id_list(
+            generation_token_ids
+        )
+    return None
 
 
 class VLLMModelConfig(BaseResponsesAPIModelConfig):
@@ -118,6 +177,14 @@ class VLLMModel(SimpleResponsesAPIModel):
         self._session_id_to_client: Dict[str, NeMoGymAsyncOpenAI] = dict()
 
         self._converter = self.get_converter()
+
+        # [PERF] debug logging: dump first N requests per backend with full rendered prompt,
+        # full body, and generation token details to help diff vllm vs dynamo paths.
+        self._perf_debug_remaining_per_backend: Dict[int, int] = {
+            i: _env_int("NEMO_GYM_PERF_DEBUG_PER_BACKEND", 3) for i in range(len(self._clients))
+        }
+        self._perf_debug_long_wait_ms = _env_int("NEMO_GYM_PERF_DEBUG_LONG_WAIT_MS", 120000)
+        self._perf_debug_max_text = _env_int("NEMO_GYM_PERF_DEBUG_MAX_TEXT", 3000)
 
     async def responses(
         self, request: Request, body: NeMoGymResponseCreateParamsNonStreaming = Body()
@@ -300,15 +367,36 @@ class VLLMModel(SimpleResponsesAPIModel):
         if extra_body:
             body_dict = extra_body | body_dict
 
+        required_prefix_token_ids = _required_prefix_token_ids_from_messages(
+            body_dict.get("messages")
+        )
+        if required_prefix_token_ids:
+            body_dict["required_prefix_token_ids"] = required_prefix_token_ids
+
         return body_dict
 
     async def chat_completions(
         self, request: Request, body: NeMoGymChatCompletionCreateParamsNonStreaming = Body()
     ) -> NeMoGymChatCompletion:
+        _perf_req_id = uuid4().hex[:8]
+        _perf_t0 = monotonic()
+        _perf_t_tok_send = _perf_t_tok_recv = None
         body_dict = body.model_dump(exclude_unset=True)
+        _perf_raw_body_hash = hashlib.sha256(
+            json.dumps(body_dict, sort_keys=True, default=str).encode("utf-8", "ignore")
+        ).hexdigest()[:16]
         body_dict = self._preprocess_chat_completion_create_params(request, body_dict)
+        _perf_body_hash = hashlib.sha256(
+            json.dumps(body_dict, sort_keys=True, default=str).encode("utf-8", "ignore")
+        ).hexdigest()[:16]
+        _perf_t_preproc = monotonic()
 
         client = self._resolve_client(request)
+        try:
+            _perf_backend_idx = self._clients.index(client)
+        except ValueError:
+            _perf_backend_idx = -1
+        _perf_backend_url = getattr(client, "base_url", "?")
 
         if not self.config.sequential_reasoning_allowed:
             last_message = body_dict["messages"][-1]
@@ -316,7 +404,9 @@ class VLLMModel(SimpleResponsesAPIModel):
                 return self._create_empty_chat_completion()
 
         try:
+            _perf_t_send = monotonic()
             chat_completion_dict = await client.create_chat_completion(**body_dict)
+            _perf_t_recv = monotonic()
         except ClientResponseError as e:
             """
             Example messages for out of context length:
@@ -390,16 +480,23 @@ class VLLMModel(SimpleResponsesAPIModel):
             # The only relevant params are model, messages, and tools.
             #
             # IMPORTANT: pass through chat-template knobs (e.g. enable_thinking)
-            # when tokenizing, otherwise `prompt_token_ids` (and therefore logged
-            # `prompt_str`) can be built with different chat template settings than
-            # the actual generation request.
+            # and prefix-reuse state when tokenizing, otherwise persisted
+            # `prompt_token_ids` can drift from the actual generation prompt.
             tokenize_body_dict = dict()
-            for key in ("model", "messages", "tools", "chat_template_kwargs"):
+            for key in (
+                "model",
+                "messages",
+                "tools",
+                "chat_template_kwargs",
+                "required_prefix_token_ids",
+            ):
                 if key in body_dict:
                     tokenize_body_dict[key] = body_dict[key]
 
             # The base url has /v1 at the end but vLLM's tokenize endpoint does not have v1, hence the ..
+            _perf_t_tok_send = monotonic()
             tokenize_response = await client.create_tokenize(**tokenize_body_dict)
+            _perf_t_tok_recv = monotonic()
             """
             END
             """
@@ -422,7 +519,190 @@ class VLLMModel(SimpleResponsesAPIModel):
             # chat_completion_dict.pop("prompt_token_ids")
             # choice_dict.pop("token_ids")
 
+        _perf_t_done = monotonic()
+        _perf_usage = chat_completion_dict.get("usage") or {}
+        _perf_finish = choice_dict.get("finish_reason", "?")
+        _perf_tok_ms = (
+            (_perf_t_tok_recv - _perf_t_tok_send) * 1000
+            if _perf_t_tok_send is not None
+            else -1
+        )
+        # Include server-assigned response id so PERF lines can be grepped
+        # against the vLLM/Dynamo server-side logs (RequestLogger, PERF_SERVER).
+        _perf_resp_id = chat_completion_dict.get("id", "?")
+        _perf_cached = (
+            (_perf_usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+            if isinstance(_perf_usage.get("prompt_tokens_details"), dict)
+            else None
+        )
+        _perf_metadata = body_dict.get("metadata") or {}
+        _perf_metadata_summary = _metadata_summary(_perf_metadata)
+        print(
+            f"[PERF] rid={_perf_req_id} resp_id={_perf_resp_id} "
+            f"backend={_perf_backend_idx} url={_perf_backend_url} "
+            f"preproc_ms={(_perf_t_preproc - _perf_t0) * 1000:.0f} "
+            f"wait_ms={(_perf_t_recv - _perf_t_send) * 1000:.0f} "
+            f"tok_ms={_perf_tok_ms:.0f} "
+            f"post_ms={(_perf_t_done - _perf_t_recv) * 1000:.0f} "
+            f"prompt_toks={_perf_usage.get('prompt_tokens', '?')} "
+            f"comp_toks={_perf_usage.get('completion_tokens', '?')} "
+            f"cached_toks={_perf_cached} "
+            f"finish={_perf_finish} "
+            f"instance_id={_perf_metadata_summary.get('instance_id')!r}",
+            flush=True,
+        )
+
+        print(
+            f"[PERF_STAGE] rid={_perf_req_id} backend={_perf_backend_idx} "
+            f"raw_body_hash={_perf_raw_body_hash} prepped_body_hash={_perf_body_hash} "
+            f"messages={len(body_dict.get('messages') or [])} "
+            f"tools={len(body_dict.get('tools') or [])} "
+            f"tool_choice={body_dict.get('tool_choice')!r} "
+            f"uses_reasoning_parser={self.config.uses_reasoning_parser} "
+            f"max_tokens={body_dict.get('max_tokens')!r} "
+            f"max_completion_tokens={body_dict.get('max_completion_tokens')!r} "
+            f"metadata={_short_text(json.dumps(_perf_metadata_summary, default=str), 800)}",
+            flush=True,
+        )
+
+        should_dump_debug = (
+            _perf_backend_idx >= 0
+            and (
+                self._perf_debug_remaining_per_backend.get(_perf_backend_idx, 0) > 0
+                or _perf_finish == "length"
+                or (_perf_t_recv - _perf_t_send) * 1000 >= self._perf_debug_long_wait_ms
+            )
+        )
+        if should_dump_debug:
+            if self._perf_debug_remaining_per_backend.get(_perf_backend_idx, 0) > 0:
+                self._perf_debug_remaining_per_backend[_perf_backend_idx] -= 1
+            await self._perf_debug_dump(
+                req_id=_perf_req_id,
+                backend_idx=_perf_backend_idx,
+                client=client,
+                body_dict=body_dict,
+                chat_completion_dict=chat_completion_dict,
+                tokenize_response_tokens=(
+                    tokenize_response.get("tokens") if self.config.return_token_id_information else None
+                ),
+                generation_token_ids=(
+                    generation_token_ids if self.config.return_token_id_information else None
+                ),
+            )
+
         return NeMoGymChatCompletion.model_validate(chat_completion_dict)
+
+    async def _perf_debug_dump(
+        self,
+        req_id: str,
+        backend_idx: int,
+        client: NeMoGymAsyncOpenAI,
+        body_dict: Dict[str, Any],
+        chat_completion_dict: Dict[str, Any],
+        tokenize_response_tokens: Optional[List[int]],
+        generation_token_ids: Optional[List[str]],
+    ) -> None:
+        """Dump detailed per-request info for debugging vllm-vs-dynamo divergence.
+
+        Logs four blocks per request, each prefixed with [PERF_DEBUG rid=...]:
+          (A) sampling-param body (minus full messages, which are logged separately).
+          (B) rendered prompt string (fetched via /detokenize on tokenize_response_tokens).
+          (C) generation head + tail token ids (decoded via /detokenize).
+          (D) response metadata (finish_reason, stop_reason, usage).
+        """
+        # (A) sampling params: everything the backend got, except we truncate messages.
+        sanitized_body = {k: v for k, v in body_dict.items() if k != "messages"}
+        messages_summary = [
+            {
+                "role": m.get("role"),
+                "content_len": len(m.get("content") or "") if isinstance(m.get("content"), str) else "nonstr",
+                "has_tool_calls": bool(m.get("tool_calls")),
+                "has_reasoning_content": bool(m.get("reasoning_content")),
+            }
+            for m in (body_dict.get("messages") or [])
+        ]
+        print(
+            f"[PERF_DEBUG rid={req_id} backend={backend_idx}] (A) sampling_params="
+            f"{_short_text(json.dumps(sanitized_body, default=str), self._perf_debug_max_text)} messages_summary="
+            f"{_short_text(json.dumps(messages_summary), min(2000, self._perf_debug_max_text))} metadata_summary="
+            f"{_short_text(json.dumps(_metadata_summary(body_dict.get('metadata') or {}), default=str), 1200)}",
+            flush=True,
+        )
+
+        # (B) rendered prompt string — detokenize the prompt_token_ids we already have.
+        # If /detokenize is not registered (e.g. NeMo-RL's custom vLLM FastAPI app
+        # doesn't expose it), fall back to logging the raw token IDs so we still
+        # have *something* to diff between backends.
+        rendered_prompt = None
+        detokenize_error = None
+        if tokenize_response_tokens:
+            try:
+                detok = await client.create_detokenize(tokens=tokenize_response_tokens)
+                rendered_prompt = detok.get("prompt") or detok.get("text") or ""
+            except Exception as e:
+                detokenize_error = f"{type(e).__name__}: {e}"
+        if rendered_prompt is not None:
+            head = rendered_prompt[:2000]
+            tail = rendered_prompt[-1000:] if len(rendered_prompt) > 3000 else ""
+            print(
+                f"[PERF_DEBUG rid={req_id} backend={backend_idx}] (B) rendered_prompt_len="
+                f"{len(rendered_prompt)} hash={hashlib.sha256(rendered_prompt.encode('utf-8', 'ignore')).hexdigest()[:16]} head={head!r}"
+                + (f" tail={tail!r}" if tail else ""),
+                flush=True,
+            )
+        elif tokenize_response_tokens:
+            head_ids = list(tokenize_response_tokens[:30])
+            tail_ids = list(tokenize_response_tokens[-30:])
+            print(
+                f"[PERF_DEBUG rid={req_id} backend={backend_idx}] (B) "
+                f"prompt_token_ids_len={len(tokenize_response_tokens)} "
+                f"first_30_ids={head_ids} last_30_ids={tail_ids} "
+                f"detokenize_error={detokenize_error!r}",
+                flush=True,
+            )
+
+        # (C) first + last generation tokens — reveal what token terminated generation
+        # (e.g. <|im_end|> vs </think> vs some other). Decode via /detokenize per group.
+        # If detokenize fails, still log the raw IDs so we can see what was generated.
+        if generation_token_ids:
+            head_ids = [int(t) for t in generation_token_ids[:30]]
+            tail_ids = [int(t) for t in generation_token_ids[-30:]]
+            head_text = tail_text = None
+            detok_err = None
+            try:
+                head_detok = await client.create_detokenize(tokens=head_ids)
+                tail_detok = await client.create_detokenize(tokens=tail_ids)
+                head_text = head_detok.get("prompt") or head_detok.get("text") or ""
+                tail_text = tail_detok.get("prompt") or tail_detok.get("text") or ""
+            except Exception as e:
+                detok_err = f"{type(e).__name__}: {e}"
+            parts = [
+                f"[PERF_DEBUG rid={req_id} backend={backend_idx}] (C) "
+                f"gen_tokens_len={len(generation_token_ids)} "
+                f"first_30_ids={head_ids} last_30_ids={tail_ids}"
+            ]
+            if head_text is not None or tail_text is not None:
+                parts.append(
+                    f" first_30_text={head_text!r} last_30_text={tail_text!r}"
+                )
+            if detok_err is not None:
+                parts.append(f" detokenize_error={detok_err!r}")
+            print("".join(parts), flush=True)
+
+        # (D) response metadata: stop_reason field if present, finish_reason, usage.
+        choice0 = (chat_completion_dict.get("choices") or [{}])[0]
+        msg = choice0.get("message", {})
+        stop_reason = choice0.get("stop_reason")
+        print(
+            f"[PERF_DEBUG rid={req_id} backend={backend_idx}] (D) "
+            f"finish_reason={choice0.get('finish_reason')!r} "
+            f"stop_reason={stop_reason!r} "
+            f"usage={json.dumps(chat_completion_dict.get('usage') or {})} "
+            f"content_len={len(msg.get('content') or '')} "
+            f"has_tool_calls={bool(msg.get('tool_calls'))} "
+            f"has_reasoning_content={bool(msg.get('reasoning_content') or msg.get('reasoning'))}",
+            flush=True,
+        )
 
     def _resolve_client(self, request: Request) -> NeMoGymAsyncOpenAI:
         session_id = request.session[SESSION_ID_KEY]

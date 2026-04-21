@@ -3236,3 +3236,40 @@ class TestVLLMConverter:
         assert captured_kwargs["guided_json"] == '{"type": "object"}'
         assert captured_kwargs["min_tokens"] == 20
         assert captured_kwargs["new_param"] == "value"
+
+    def test_required_prefix_token_ids_forwarded_from_last_assistant_message(
+        self, monkeypatch: MonkeyPatch
+    ):
+        config = VLLMModelConfig(
+            host="0.0.0.0",
+            port=8081,
+            base_url="http://api.openai.com/v1",
+            api_key="dummy_key",  # pragma: allowlist secret
+            model="dummy_model",
+            entrypoint="",
+            name="",
+            return_token_id_information=True,
+            uses_reasoning_parser=False,
+        )
+        server = VLLMModel(config=config, server_client=MagicMock(spec=ServerClient))
+
+        body_dict = {
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "assistant",
+                    "content": "done",
+                    "prompt_token_ids": [1, 2, 3],
+                    "generation_token_ids": ["4", "5"],
+                    "generation_log_probs": [-0.1, -0.2],
+                },
+                {"role": "user", "content": "next"},
+            ],
+            "metadata": {},
+        }
+
+        processed = server._preprocess_chat_completion_create_params(
+            MagicMock(spec=Request), body_dict
+        )
+
+        assert processed["required_prefix_token_ids"] == [1, 2, 3, 4, 5]
