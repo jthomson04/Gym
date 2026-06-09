@@ -117,6 +117,15 @@ class SWEBenchWrapperConfig(BaseResponsesAPIAgentConfig):
         default=32 * 1024, description="Memory limit for the apptainer container (MB)"
     )
 
+    extra_container_binds: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Extra host paths to bind into every apptainer container, each as "
+            "'src:dst'. Used e.g. to inject a static tmux binary the arm64 "
+            "SWE-bench images lack (OpenHands' bash runtime requires tmux)."
+        ),
+    )
+
     command_exec_timeout: int = Field(default=5 * 60, description="Timeout for executing the command (seconds)")
 
     # Concurrency control
@@ -1182,7 +1191,17 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
             "chown $uid:$uid /tmp/tmux-$uid || true && "
             "chmod 700 /tmp/tmux-$uid && "
             "tmux -S /tmp/tmux-$uid/default start-server || true && "
-            "cp /openhands_setup/miniforge3/bin/jq /usr/local/bin/jq 2>/dev/null || true && "
+            # ROOT-CAUSE FIX (arm64): the bundled miniforge3 (prepended to PATH
+            # above) is x86_64, so its `jq` cannot execute on this arm64
+            # container ("Exec format error"). instance_swe_entry.sh runs
+            # `item=$(jq ... )` -> empty -> "No item found" -> `exit 1`. Since
+            # that script is `source`d into the OpenHands pane shell, the exit
+            # kills the pane -> the tmux session/server dies -> every later
+            # command (notably the agent's `source`) hangs to the 600s cap, so
+            # no rollout ever reaches the model. Shadow it with the container's
+            # native arm64 jq so PATH resolution wins.
+            "mkdir -p /tmp/_archbin && ln -sf /usr/bin/jq /tmp/_archbin/jq 2>/dev/null || true && "
+            "export PATH=/tmp/_archbin:$PATH && "
             # Use pre-built OpenHands
             "cd /openhands_setup/OpenHands && "
             "export RUNTIME=local && "
@@ -1278,6 +1297,10 @@ def _classify_agent_error(err: Optional[str]) -> Optional[str]:
     runtime_env={
         "py_executable": sys.executable,
     },
+    # Each rollout drives an OpenHands action_execution_server. The 600s
+    # `source instance_swe_entry.sh` hang was root-caused to x86 jq on arm64 +
+    # tmux (now fixed), NOT CPU starvation -- so num_cpus stays low to pack high
+    # concurrency (e.g. 768 rollouts on one ~180-CPU node for gen-scaling).
     num_cpus=0.1,
 )
 def runner_ray_remote(params_dict: dict[str, Any]) -> Optional[Path]:
@@ -1954,6 +1977,12 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         script_path.write_text(combined_command)
         container_script_path = f"/container_scripts/{command.mode}_script.sh"
         mount_args.append(f"--mount type=bind,src={script_path},dst={container_script_path},ro")
+
+        # Inject extra host binds (e.g. a static tmux that arm64 SWE-bench images lack;
+        # OpenHands' bash runtime requires tmux). Each entry is 'src:dst'.
+        for bind in params.extra_container_binds:
+            src, _, dst = bind.partition(":")
+            mount_args.append(f"--mount type=bind,src={src},dst={dst},ro")
 
         mount_str = " ".join(mount_args)
 
