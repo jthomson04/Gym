@@ -222,6 +222,7 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
     extra_body: Optional[Dict[str, Any]] = None
 
     default_headers: Dict[str, str] = Field(default_factory=dict)
+    session_id_header: Optional[str] = Field(default=None, min_length=1)
 
     # Optional path to a file that publishes the current backend base_url.
     # Used for shared serving jobs that move hosts when they restart.
@@ -1722,6 +1723,15 @@ class VLLMModel(SimpleResponsesAPIModel):
             digest = hashlib.sha256(session_id.encode("utf-8")).digest()
             client_idx = int.from_bytes(digest[:8], byteorder="big") % len(self._clients)
             client = self._clients[client_idx]
+            if self.config.session_id_header is not None:
+                client = client.model_copy(
+                    update={
+                        "default_headers": {
+                            **client.default_headers,
+                            self.config.session_id_header: session_id,
+                        }
+                    }
+                )
             self._session_id_to_client[session_id] = client
         client = self._session_id_to_client[session_id]
 

@@ -804,6 +804,23 @@ class TestApp:
 
         assert client_indices[0] == client_indices[1]
 
+    def test_session_header_is_stable_and_preserves_default_headers(self, monkeypatch: MonkeyPatch) -> None:
+        server = self._setup_server(monkeypatch)
+        server.config.session_id_header = "X-Dynamo-Session-ID"
+        server._clients = [
+            client.model_copy(update={"default_headers": {"X-Static": "keep"}}) for client in server._clients
+        ]
+        request = MagicMock()
+        request.session = {SESSION_ID_KEY: "target-session"}
+
+        client = server._resolve_client(request)
+
+        assert client.default_headers == {
+            "X-Static": "keep",
+            "X-Dynamo-Session-ID": "target-session",
+        }
+        assert server._resolve_client(request) is client
+
     def test_responses_multistep(self, monkeypatch: MonkeyPatch):
         server = self._setup_server(monkeypatch)
         app = server.setup_webserver()
