@@ -819,6 +819,7 @@ class TestApp:
             "X-Static": "keep",
             "X-Dynamo-Session-ID": "target-session",
         }
+        assert server._clients[0].default_headers == {"X-Static": "keep"}
         assert server._resolve_client(request) is client
 
     def test_responses_multistep(self, monkeypatch: MonkeyPatch):
