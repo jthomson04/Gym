@@ -76,6 +76,7 @@ from nemo_gym.token_id_capture.config import token_id_capture_config
 from nemo_gym.token_id_capture.external_capture import (
     DYNAMO_GYM_REQUEST_ANNOTATION,
     DYNAMO_PREFIX_ANNOTATION_PREFIX,
+    DYNAMO_SESSION_ID_HEADER,
     ExternalCaptureHandler,
     annotate_dynamo_request,
     make_external_capture_handler,
@@ -1574,6 +1575,10 @@ class VLLMModel(SimpleResponsesAPIModel):
         extra_headers = (
             self._external_capture_handler.request_headers() if self._external_capture_handler is not None else {}
         )
+        if self.config.dynamo_frontend:
+            # The router picks an engine before that engine splices the echoed prefix, so it can send a later
+            # turn away from the engine caching the earlier ones. Pin each rollout to one engine instead.
+            extra_headers.setdefault(DYNAMO_SESSION_ID_HEADER, self._routing_session_id(request))
         execution["upstream_attempted"] = True
         context = current_capture_context()
         transport_options = (
@@ -2368,12 +2373,16 @@ class VLLMModel(SimpleResponsesAPIModel):
             raise ValueError(f"no generation_cut_control_url is configured for backend {base_url}")
         return control_url.rstrip("/")
 
-    def _resolve_client(self, request: Request) -> NeMoGymAsyncOpenAI:
-        self._maybe_rebind_endpoint()
+    @staticmethod
+    def _routing_session_id(request: Request) -> str:
         # Route by rollout when the call carries one: agents that drop cookies get a new
         # session per call, which scatters a rollout's turns and lets the slowest endpoint
         # collect them. Keying on the rollout keeps its turns on one endpoint.
-        session_id = current_rollout_id() or request.session[SESSION_ID_KEY]
+        return current_rollout_id() or request.session[SESSION_ID_KEY]
+
+    def _resolve_client(self, request: Request) -> NeMoGymAsyncOpenAI:
+        self._maybe_rebind_endpoint()
+        session_id = self._routing_session_id(request)
         client = self._session_id_to_client.get(session_id)
         if self.config.route_around_failing_endpoints:
             hashed = self._hashed_client(session_id)
