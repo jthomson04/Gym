@@ -1746,6 +1746,8 @@ class TestApp:
         if not capture:
             assert call_annotation == "ng_prefix:[1,2]"
         assert sent[0]["headers"]["x-default"] == "kept"
+        # Every call pins its rollout to one engine, keyed like the client choice; capture keeps its admission's id.
+        assert sent[0]["headers"]["x-dynamo-session-id"] == ("rollout-1" if capture else "session-1")
         if error:
             return
         served = response.model_dump()
@@ -1758,13 +1760,11 @@ class TestApp:
             assert CaptureAdmission.model_validate_json(call_annotation.removeprefix("ng_capture:")) == (
                 context.capture_admission
             )
-            assert sent[0]["headers"]["x-dynamo-session-id"] == "rollout-1"
             assert context.committed is True
             manifest = await context.lineage_store.manifest("rollout-1")
             assert manifest["records"][0]["staging_key"] == "rollout-1/c1"
             assert "ng_commit_coords" not in served
         else:
-            assert "x-dynamo-session-id" not in sent[0]["headers"]
             message = served["choices"][0]["message"]
             assert message["prompt_token_ids"] == [1, 2]
             assert message["generation_token_ids"] == [3]
