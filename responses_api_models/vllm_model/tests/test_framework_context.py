@@ -24,6 +24,7 @@ from nemo_gym.core import NeMoGymResponseCreateParamsNonStreaming, current_rollo
 from nemo_gym.openai_utils import NeMoGymAsyncOpenAI
 from nemo_gym.responses_streaming import is_responses_lifecycle_chunk
 from nemo_gym.server_runtime._checkpoint.control import CheckpointRequest
+from nemo_gym.token_id_capture.external_capture import DYNAMO_GYM_EXTRAS_ANNOTATION_PREFIX, DYNAMO_SESSION_ID_HEADER
 from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER
 from nemo_gym.token_id_capture.sink import NG_CAPTURE_FIELD, NG_COMMIT_COORDS_FIELD
 from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
@@ -90,8 +91,13 @@ def make_capture_harness(
     decide_input=None,
     parent_resolution_mode="source_history",
     checkpoint=False,
+    dynamo=False,
 ):
-    """Allow paired RL tests to inject their staging transport and prefix reader."""
+    """Allow paired RL tests to inject their staging transport and prefix reader.
+
+    ``dynamo`` serves the policy through the Dynamo dialect: the worker reads NeMo RL's fields from the
+    ``nemo_rl:gym:`` annotation and answers in ``nvext.nemo_rl``, as NeMo RL's engine behind Dynamo does.
+    """
     sink = sink if sink is not None else MemoryStagingSink()
     fetch_prefix = fetch_prefix if fetch_prefix is not None else sink.prefix
     capture = RolloutTokenCapture(sink=sink, weight_version_fn=lambda: 7)
@@ -107,6 +113,8 @@ def make_capture_harness(
     }
     if checkpoint:
         config["checkpoint"] = {"enabled": True, "control_auth_token": "test-control"}
+    if dynamo:
+        config["token_id_capture"]["external_staging_backend"] = "dynamo_worker"
     monkeypatch.setenv("NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN", "test-control")
     monkeypatch.setattr(nemo_gym.client.server_client, "get_global_config_dict", lambda: config)
     model = VLLMModel(
@@ -122,6 +130,7 @@ def make_capture_harness(
             return_token_id_information=False,
             uses_reasoning_parser=reasoning,
             checkpoint={"policy": checkpoint},
+            dynamo_frontend=dynamo,
         ),
         server_client=MagicMock(spec=ServerClient, global_config_dict=config),
     )
@@ -132,11 +141,10 @@ def make_capture_harness(
         TestClient(app, raise_server_exceptions=False), middleware.kwargs["lineage_store"], sink, model=model
     )
 
-    async def worker(client, *, _resend_after_disconnect=True, **body):
+    async def worker(client, *, _resend_after_disconnect=True, extra_headers=None, **body):
         # A real client survives request-scoped model_copy; only its backend is replaced.
         index = len(harness.worker_calls) + 1
-        admission = CaptureAdmission.model_validate(body[NG_CAPTURE_FIELD]) if NG_CAPTURE_FIELD in body else None
-        harness.worker_calls.append((admission, _resend_after_disconnect))
+        fields = _dynamo_gym_extras(body) if dynamo else body
         payload = {
             "id": f"chatcmpl-{index}",
             "created": 0,
@@ -144,6 +152,12 @@ def make_capture_harness(
             "object": "chat.completion",
             "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "answer"}}],
         }
+        if fields.get("ng_measure"):
+            # The engine reports the prompt length without generating or staging.
+            payload["nvext"] = {"nemo_rl": {"prompt_token_count": 19, "ng_context_measured": True}}
+            return payload
+        admission = CaptureAdmission.model_validate(fields[NG_CAPTURE_FIELD]) if NG_CAPTURE_FIELD in fields else None
+        harness.worker_calls.append((admission, _resend_after_disconnect))
         if reasoning:
             payload["choices"][0]["message"]["reasoning"] = f"reasoning {index}"
         if admission is not None:
@@ -165,6 +179,11 @@ def make_capture_harness(
             coords = capture.complete_call(
                 active, prompt_token_ids=prompt, generated_token_ids=generated, generated_logprobs=[-0.25]
             )
+            if dynamo:
+                # The frontend drops unknown response fields, so the acknowledgement is all the engine returns.
+                if not harness.omit_coords:
+                    payload["nvext"] = {"nemo_rl": {NG_COMMIT_COORDS_FIELD: coords.model_dump(mode="json")}}
+                return payload
             if not harness.omit_coords:
                 payload[NG_COMMIT_COORDS_FIELD] = coords.model_dump(mode="json")
             # These transport-only arrays must disappear on the served agent response.
@@ -204,6 +223,13 @@ def make_capture_harness(
     return harness
 
 
+def _dynamo_gym_extras(body):
+    """Return NeMo RL's fields from a Dynamo dialect request's one ``nemo_rl:gym:`` annotation."""
+    (annotation,) = body["nvext"]["annotations"]
+    assert annotation.startswith(DYNAMO_GYM_EXTRAS_ANNOTATION_PREFIX)
+    return json.loads(annotation.removeprefix(DYNAMO_GYM_EXTRAS_ANNOTATION_PREFIX))
+
+
 def assert_clean(response, status=200):
     assert response.status_code == status, response.text
     assert NG_CAPTURE_FIELD not in response.text
@@ -224,8 +250,9 @@ def test_sequential_calls_share_attempt_and_store_independent_roots(monkeypatch,
     assert harness.worker_calls[1][0].parent_call_id == manifest.records[0].model_call_id
 
 
-def test_measurement_uses_same_candidate_without_ledger_writes(monkeypatch, tmp_path):
-    harness = make_capture_harness(monkeypatch, tmp_path)
+@pytest.mark.parametrize("dynamo", [False, True], ids=["vllm", "dynamo"])
+def test_measurement_uses_same_candidate_without_ledger_writes(monkeypatch, tmp_path, dynamo):
+    harness = make_capture_harness(monkeypatch, tmp_path, dynamo=dynamo)
     first = assert_clean(harness.post("attempt", HISTORY))
     assert_clean(harness.post("attempt", HISTORY))  # A newer rejected response.
     before = harness.manifest("attempt")
@@ -236,13 +263,24 @@ def test_measurement_uses_same_candidate_without_ledger_writes(monkeypatch, tmp_
         calls.append(body)
         return {"prompt_token_count": 19, "ng_context_measured": True}
 
+    worker = NeMoGymAsyncOpenAI.create_chat_completion
+
+    async def measure_through_chat(client, *, extra_headers=None, **body):
+        # The Dynamo frontend has no /tokenize, so the dialect measures with a chat call marked ng_measure.
+        assert extra_headers == {DYNAMO_SESSION_ID_HEADER: "attempt"}
+        calls.append(_dynamo_gym_extras(body))
+        assert calls[0].pop("ng_measure") is True
+        return await worker(client, **body)
+
     monkeypatch.setattr(NeMoGymAsyncOpenAI, "create_tokenize", tokenize)
+    monkeypatch.setattr(NeMoGymAsyncOpenAI, "create_chat_completion", measure_through_chat)
     response = harness.client.post(
         "/ng-rollout/attempt/training-token-capture/context/measure",
         json={"input": HISTORY + first["output"] + [{"role": "user", "content": "next"}]},
     )
     assert response.status_code == 200, response.text
     assert response.json() == {"prompt_token_count": 19}
+    assert len(calls) == 1
     assert calls[0][NG_CAPTURE_FIELD]["mode"] == "candidate"
     assert calls[0][NG_CAPTURE_FIELD]["parent_call_id"] == before.records[0].model_call_id
     assert harness.manifest("attempt") == before
