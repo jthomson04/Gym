@@ -28,6 +28,7 @@ from typing import Any, Awaitable, ClassVar, Dict, List, Literal, Optional, Unio
 from aiohttp.client_exceptions import ClientConnectionError, ClientResponseError
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from multidict import CIMultiDict
 from openai.types.completion_usage import CompletionTokensDetails, CompletionUsage, PromptTokensDetails
 from openai.types.shared import ReasoningEffort
 from pydantic import Field, PrivateAttr, TypeAdapter, ValidationError, model_validator
@@ -78,6 +79,7 @@ from nemo_gym.token_id_capture.external_capture import (
     add_dynamo_gym_extras,
     make_external_capture_handler,
     pop_dynamo_call_result,
+    split_dynamo_capture_refusal,
     validate_framework_context_options,
 )
 from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER, CaptureAdmissionError, CaptureInputError
@@ -159,6 +161,25 @@ def _names_context_window(message: str) -> bool:
     if isinstance(payload, dict):
         payload = payload.get("error", payload)
     return isinstance(payload, dict) and payload.get("type") == "exceed_context_size_error"
+
+
+def _lift_dynamo_capture_refusal(error: ClientResponseError) -> None:
+    """Move the Dynamo frontend's refusal acknowledgement off the error message onto ``CAPTURE_REFUSAL_HEADER``.
+
+    The error then reads as the native server's: the acknowledgement in its header, the engine's own message.
+    """
+    try:
+        body = json.loads(getattr(error, "response_content", b"") or b"")
+    except ValueError:
+        return
+    if not isinstance(body, dict) or not isinstance(body.get("message"), str):
+        return
+    message, model_call_id = split_dynamo_capture_refusal(body["message"])
+    if model_call_id is None:
+        return
+    error.response_content = json.dumps({**body, "message": message}).encode()
+    error.headers = CIMultiDict(error.headers or {})
+    error.headers[CAPTURE_REFUSAL_HEADER] = model_call_id
 
 
 def _is_context_length_error(error: ClientResponseError) -> bool:
@@ -699,6 +720,8 @@ class VLLMModel(SimpleResponsesAPIModel):
 
     async def _propagate_context_refusal(self, error: ClientResponseError) -> bool:
         """Preserve length errors in framework mode; settle only worker-acknowledged refusals."""
+        if self.config.dynamo_frontend:
+            _lift_dynamo_capture_refusal(error)
         context = current_capture_context()
         source_history = context is not None and context.parent_resolution_mode == "source_history"
         if (
