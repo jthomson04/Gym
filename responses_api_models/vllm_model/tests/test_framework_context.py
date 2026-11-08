@@ -24,7 +24,11 @@ from nemo_gym.core import NeMoGymResponseCreateParamsNonStreaming, current_rollo
 from nemo_gym.openai_utils import NeMoGymAsyncOpenAI
 from nemo_gym.responses_streaming import is_responses_lifecycle_chunk
 from nemo_gym.server_runtime._checkpoint.control import CheckpointRequest
-from nemo_gym.token_id_capture.external_capture import DYNAMO_GYM_EXTRAS_ANNOTATION_PREFIX, DYNAMO_SESSION_ID_HEADER
+from nemo_gym.token_id_capture.external_capture import (
+    DYNAMO_GYM_EXTRAS_ANNOTATION_PREFIX,
+    DYNAMO_SESSION_ID_HEADER,
+    dynamo_capture_refusal_suffix,
+)
 from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER
 from nemo_gym.token_id_capture.sink import NG_CAPTURE_FIELD, NG_COMMIT_COORDS_FIELD
 from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
@@ -995,23 +999,35 @@ def test_engine_errors_preserve_unacknowledged_intents(monkeypatch, tmp_path, st
 @pytest.mark.parametrize("dialect", ["responses", "chat/completions"])
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("acknowledgement", ["correct", "missing", "wrong-call"])
-def test_context_refusal_settles_capture_only_with_worker_ack(monkeypatch, tmp_path, dialect, stream, acknowledgement):
-    harness = make_capture_harness(monkeypatch, tmp_path)
+@pytest.mark.parametrize("dynamo", [False, True], ids=["vllm", "dynamo"])
+def test_context_refusal_settles_capture_only_with_worker_ack(
+    monkeypatch, tmp_path, dialect, stream, acknowledgement, dynamo
+):
+    harness = make_capture_harness(monkeypatch, tmp_path, dynamo=dynamo)
     first = assert_clean(harness.post("attempt", HISTORY))
     before = harness.manifest("attempt")
     worker = NeMoGymAsyncOpenAI.create_chat_completion
     refused_calls = []
 
     async def refuse(client, **body):
-        admission = CaptureAdmission.model_validate(body[NG_CAPTURE_FIELD])
+        fields = _dynamo_gym_extras(body) if dynamo else body
+        admission = CaptureAdmission.model_validate(fields[NG_CAPTURE_FIELD])
         refused_calls.append(admission.model_call_id)
-        headers = {}
-        if acknowledgement != "missing":
-            headers[CAPTURE_REFUSAL_HEADER] = (
-                admission.model_call_id if acknowledgement == "correct" else "another-call"
-            )
+        acknowledged = {"correct": admission.model_call_id, "missing": None, "wrong-call": "another-call"}[
+            acknowledgement
+        ]
+        message, headers = "maximum context length is 32768 tokens", {}
+        if dynamo:
+            # Dynamo's frontend forwards only the status and the message, in its own flat body.
+            if acknowledged is not None:
+                message += dynamo_capture_refusal_suffix(acknowledged)
+            content = {"message": message, "type": "Bad Request", "code": 400}
+        else:
+            if acknowledged is not None:
+                headers[CAPTURE_REFUSAL_HEADER] = acknowledged
+            content = {"error": {"message": message, "code": 400}}
         error = ClientResponseError(MagicMock(real_url="http://worker.test"), (), status=400, headers=headers)
-        error.response_content = b'{"error":{"message":"maximum context length is 32768 tokens","code":400}}'
+        error.response_content = json.dumps(content).encode()
         raise error
 
     monkeypatch.setattr(NeMoGymAsyncOpenAI, "create_chat_completion", refuse)
